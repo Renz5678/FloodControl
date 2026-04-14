@@ -2,13 +2,15 @@ import { useState } from 'react'
 import { nodes, FLOOD_RISK_LABELS } from '../data/graph'
 import { dijkstra } from '../data/dijkstra'
 
-const ORIGIN_ID = 'pup'
+const DESTINATION_ID = 'pup'
 
-// Nodes available as destinations (all except origin)
-const destinations = Object.values(nodes).filter(n => n.id !== ORIGIN_ID)
+// All nodes except PUP Gate are valid origins, sorted alphabetically
+const origins = Object.values(nodes)
+  .filter(n => n.id !== DESTINATION_ID)
+  .sort((a, b) => a.label.localeCompare(b.label))
 
-export default function RoutePanel({ onRoute }) {
-  const [destination, setDestination] = useState(destinations[4].id) // default: Katipunan
+export default function RoutePanel({ onRoute, geoFloodRisk }) {
+  const [origin, setOrigin] = useState(origins[0].id)
   const [result, setResult] = useState(null)
   const [loading, setLoading] = useState(false)
 
@@ -18,15 +20,20 @@ export default function RoutePanel({ onRoute }) {
 
     // Small delay to let UI update before algorithm runs
     setTimeout(() => {
-      const res = dijkstra(ORIGIN_ID, destination)
+      const res = dijkstra(origin, DESTINATION_ID)
       setResult(res)
       onRoute(res.found ? res.path : [])
       setLoading(false)
     }, 80)
   }
 
-  const riskMeta = result ? FLOOD_RISK_LABELS[result.maxRisk] : null
-  const destNode = nodes[destination]
+  // Use the HIGHER of Dijkstra's graph-edge risk and the geometry-detected risk.
+  // geoFloodRisk is null while OSRM is still loading (show graph risk in the meantime).
+  const displayRisk = result
+    ? Math.max(result.maxRisk, geoFloodRisk ?? result.maxRisk)
+    : 0
+  const riskMeta = result ? FLOOD_RISK_LABELS[displayRisk] : null
+  const originNode = nodes[origin]
 
   return (
     <div style={{
@@ -62,48 +69,48 @@ export default function RoutePanel({ onRoute }) {
           </div>
         </div>
 
-        {/* Origin */}
+        {/* Origin (user-selectable) */}
         <div style={{ marginBottom: '12px' }}>
           <label style={{ fontSize: '0.72rem', color: 'var(--color-muted)', fontWeight: 600,
                           textTransform: 'uppercase', letterSpacing: '0.05em', display: 'block',
                           marginBottom: '6px' }}>
-            Origin
+            Your Starting Point
           </label>
-          <div style={{
-            display: 'flex', alignItems: 'center', gap: '8px',
-            background: 'var(--color-surface2)',
-            border: '1px solid rgba(59,130,246,0.4)',
-            borderRadius: '10px', padding: '9px 14px',
-          }}>
-            <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#3b82f6',
-                          boxShadow: '0 0 6px #3b82f6' }} />
-            <span style={{ fontSize: '0.9rem', fontWeight: 500, color: 'var(--color-text)' }}>
-              PUP Gate
-            </span>
-            <span style={{ marginLeft: 'auto', fontSize: '0.72rem', color: 'var(--color-muted)',
-                            background: 'rgba(59,130,246,0.1)', padding: '2px 7px', borderRadius: '6px',
-                            border: '1px solid rgba(59,130,246,0.2)' }}>
-              Fixed
-            </span>
-          </div>
+          <select
+            className="select-custom"
+            value={origin}
+            onChange={e => { setOrigin(e.target.value); setResult(null); onRoute([]) }}
+          >
+            {origins.map(n => (
+              <option key={n.id} value={n.id}>{n.label}</option>
+            ))}
+          </select>
         </div>
 
-        {/* Destination */}
+        {/* Destination (always PUP Gate) */}
         <div style={{ marginBottom: '14px' }}>
           <label style={{ fontSize: '0.72rem', color: 'var(--color-muted)', fontWeight: 600,
                           textTransform: 'uppercase', letterSpacing: '0.05em', display: 'block',
                           marginBottom: '6px' }}>
             Destination
           </label>
-          <select
-            className="select-custom"
-            value={destination}
-            onChange={e => { setDestination(e.target.value); setResult(null); onRoute([]) }}
-          >
-            {destinations.map(n => (
-              <option key={n.id} value={n.id}>{n.label}</option>
-            ))}
-          </select>
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: '8px',
+            background: 'var(--color-surface2)',
+            border: '1px solid rgba(34,197,94,0.4)',
+            borderRadius: '10px', padding: '9px 14px',
+          }}>
+            <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#22c55e',
+                          boxShadow: '0 0 6px #22c55e' }} />
+            <span style={{ fontSize: '0.9rem', fontWeight: 500, color: 'var(--color-text)' }}>
+              PUP Gate
+            </span>
+            <span style={{ marginLeft: 'auto', fontSize: '0.72rem', color: 'var(--color-muted)',
+                            background: 'rgba(34,197,94,0.1)', padding: '2px 7px', borderRadius: '6px',
+                            border: '1px solid rgba(34,197,94,0.2)' }}>
+              Fixed
+            </span>
+          </div>
         </div>
 
         {/* Find Route button */}
@@ -133,7 +140,7 @@ export default function RoutePanel({ onRoute }) {
           {result.found ? (
             <>
               {/* Flood-free / flood-warning banner */}
-              {result.maxRisk === 0 ? (
+              {displayRisk === 0 ? (
                 <div style={{
                   display: 'flex', alignItems: 'center', gap: '8px',
                   background: 'rgba(34,197,94,0.1)',
@@ -148,6 +155,24 @@ export default function RoutePanel({ onRoute }) {
                     </div>
                     <div style={{ fontSize: '0.72rem', color: 'var(--color-muted)', marginTop: '1px' }}>
                       Avoids all flood-prone areas
+                    </div>
+                  </div>
+                </div>
+              ) : geoFloodRisk !== null && geoFloodRisk > result.maxRisk ? (
+                <div style={{
+                  display: 'flex', alignItems: 'center', gap: '8px',
+                  background: 'rgba(249,115,22,0.1)',
+                  border: '1px solid rgba(249,115,22,0.35)',
+                  borderRadius: '10px', padding: '10px 12px',
+                  marginBottom: '14px',
+                }}>
+                  <span style={{ fontSize: '1.2rem' }}>⚠️</span>
+                  <div>
+                    <div style={{ fontWeight: 700, fontSize: '0.85rem', color: '#f97316' }}>
+                      Flood Zone Detected on Road
+                    </div>
+                    <div style={{ fontSize: '0.72rem', color: 'var(--color-muted)', marginTop: '1px' }}>
+                      Route passes through a flood-affected area
                     </div>
                   </div>
                 </div>
@@ -209,7 +234,7 @@ export default function RoutePanel({ onRoute }) {
               <div style={{ fontSize: '2rem', marginBottom: '8px' }}>⛔</div>
               <div style={{ fontWeight: 600, marginBottom: '4px' }}>No Route Found</div>
               <div style={{ fontSize: '0.82rem', color: 'var(--color-muted)' }}>
-                No path exists from PUP Gate to {destNode.label}.
+                No path exists from {originNode.label} to PUP Gate.
               </div>
             </div>
           )}
@@ -225,7 +250,8 @@ export default function RoutePanel({ onRoute }) {
         <div style={{ display: 'flex', flexDirection: 'column', gap: '7px' }}>
           <LegendItem color="#22c55e" label="Optimal safe route" type="line" />
           <LegendItem color="#f97316" label="Flood zone (5-yr return period)" type="fill" />
-          <LegendItem color="#3b82f6" label="PUP Gate (Origin)" type="dot" />
+          <LegendItem color="#3b82f6" label="Starting point" type="dot" />
+          <LegendItem color="#22c55e" label="PUP Gate (Destination)" type="dot" />
         </div>
       </div>
     </div>

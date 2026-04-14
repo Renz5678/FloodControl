@@ -35,29 +35,67 @@ function createNodeIcon(color = '#3b82f6', pulse = false) {
   return L.divIcon({ html, className: '', iconAnchor: [size / 2, size / 2] })
 }
 
+
+// ── Geometry helpers ─────────────────────────────────────────────────────
+
 /**
- * Fetch road-following geometry from OSRM for a single edge.
- * Returns array of [lat, lng] pairs.
+ * Ray-casting point-in-polygon.
+ * point = [lat, lng] (Leaflet order)
+ * ring  = array of GeoJSON [lng, lat] pairs
  */
-async function fetchEdgeGeometry(fromCoords, toCoords) {
-  const [fromLat, fromLng] = fromCoords
-  const [toLat, toLng] = toCoords
-  const url = `${OSRM_BASE}/${fromLng},${fromLat};${toLng},${toLat}?overview=full&geometries=geojson`
-  const res = await fetch(url)
-  if (!res.ok) throw new Error(`OSRM error: ${res.status}`)
-  const data = await res.json()
-  if (data.code !== 'Ok' || !data.routes?.[0]) throw new Error('No OSRM route')
-  // OSRM returns [lng, lat] — convert to Leaflet [lat, lng]
-  return data.routes[0].geometry.coordinates.map(([lng, lat]) => [lat, lng])
+function pointInPolygon([lat, lng], ring) {
+  let inside = false
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [rLng_i, rLat_i] = ring[i]
+    const [rLng_j, rLat_j] = ring[j]
+    const intersect =
+      rLat_i > lat !== rLat_j > lat &&
+      lng < ((rLng_j - rLng_i) * (lat - rLat_i)) / (rLat_j - rLat_i) + rLng_i
+    if (intersect) inside = !inside
+  }
+  return inside
 }
 
-export default function MapView({ routePath }) {
+/**
+ * Check whether any sampled route point lies inside a flood zone polygon.
+ * Returns the detected max risk (0 = safe, 1 = moderate).
+ * All flood features in this dataset are treated as moderate risk (1).
+ */
+function checkRouteFloodRisk(routePoints, geojson) {
+  const features = geojson?.features ?? []
+  // Sample every 4th point for performance
+  const sampled = routePoints.filter((_, i) => i % 4 === 0)
+
+  for (const point of sampled) {
+    for (const feature of features) {
+      const geom = feature.geometry
+      if (!geom) continue
+
+      // Normalise to [[ring,...], ...] regardless of Polygon vs MultiPolygon
+      const ringsets =
+        geom.type === 'Polygon'
+          ? [geom.coordinates]
+          : geom.type === 'MultiPolygon'
+          ? geom.coordinates
+          : []
+
+      for (const rings of ringsets) {
+        const outer = rings[0] // first ring = outer boundary
+        if (pointInPolygon(point, outer)) return 1
+      }
+    }
+  }
+  return 0
+}
+
+export default function MapView({ routePath, onFloodRisk }) {
   const mapRef = useRef(null)
   const mapInstanceRef = useRef(null)
   const routeLayerRef = useRef(null)
   const nodeMarkersRef = useRef([])
   const floodLayerRef = useRef(null)
-  const fetchTokenRef = useRef(0) // cancellation token
+  const floodJsonRef = useRef(null)   // raw GeoJSON kept for intersection tests
+  const fetchTokenRef = useRef(0)     // cancellation token
 
   // Init map once
   useEffect(() => {
@@ -84,10 +122,11 @@ export default function MapView({ routePath }) {
 
     mapInstanceRef.current = map
 
-    // Load flood overlay
+    // Load flood overlay — also store raw GeoJSON for intersection tests
     fetch('/flood_data.json')
       .then(r => r.json())
       .then(geojson => {
+        floodJsonRef.current = geojson          // ← keep for route checks
         floodLayerRef.current = L.geoJSON(geojson, {
           style: () => ({
             color: '#f97316',
@@ -114,16 +153,16 @@ export default function MapView({ routePath }) {
 
     // Draw all nodes as small dots
     Object.values(nodes).forEach(node => {
-      const isOrigin = node.id === 'pup'
+      const isPup = node.id === 'pup'
       const marker = L.marker(node.coords, {
-        icon: createNodeIcon(isOrigin ? '#3b82f6' : '#64748b', isOrigin),
+        icon: createNodeIcon(isPup ? '#22c55e' : '#64748b', isPup),
         title: node.label,
       })
 
       marker.bindTooltip(
         `<div style="background:#1a1d27;color:#e2e8f0;border:1px solid rgba(255,255,255,0.1);
                     border-radius:6px;padding:5px 10px;font-family:Inter,sans-serif;font-size:0.8rem;">
-          ${isOrigin ? '📍 ' : ''}${node.label}
+          ${isPup ? '🏁 ' : ''}${node.label}
         </div>`,
         { opacity: 1, className: 'leaflet-tooltip-custom' }
       )
@@ -147,7 +186,8 @@ export default function MapView({ routePath }) {
 
     // Reset all node markers to default
     nodeMarkersRef.current.forEach(({ id, marker }) => {
-      marker.setIcon(createNodeIcon(id === 'pup' ? '#3b82f6' : '#64748b', id === 'pup'))
+      const isPup = id === 'pup'
+      marker.setIcon(createNodeIcon(isPup ? '#22c55e' : '#64748b', isPup))
     })
 
     if (!routePath || routePath.length < 2) return
@@ -166,27 +206,37 @@ export default function MapView({ routePath }) {
     routeLayerRef.current = placeholder
     map.fitBounds(L.latLngBounds(placeholderCoords), { padding: [60, 60] })
 
-    // Fetch road geometry for every consecutive edge in the path
+    /**
+     * Single OSRM request with ALL waypoints in one shot.
+     * This prevents the per-segment snapping that caused unnecessary left/right jogs.
+     */
     async function fetchAndDraw() {
       try {
-        const edgeFetches = []
-        for (let i = 0; i < routePath.length - 1; i++) {
-          edgeFetches.push(
-            fetchEdgeGeometry(nodes[routePath[i]].coords, nodes[routePath[i + 1]].coords)
-          )
-        }
+        // Build waypoint string: OSRM expects lng,lat order
+        const waypointsStr = routePath
+          .map(id => {
+            const [lat, lng] = nodes[id].coords
+            return `${lng},${lat}`
+          })
+          .join(';')
 
-        // Run all edge fetches in parallel
-        const segments = await Promise.all(edgeFetches)
+        const url = `${OSRM_BASE}/${waypointsStr}?overview=full&geometries=geojson`
+        const res = await fetch(url)
+        if (!res.ok) throw new Error(`OSRM error: ${res.status}`)
+        const data = await res.json()
+        if (data.code !== 'Ok' || !data.routes?.[0]) throw new Error('No OSRM route')
+
+        // OSRM returns [lng, lat] — convert to Leaflet [lat, lng]
+        const stitched = data.routes[0].geometry.coordinates.map(([lng, lat]) => [lat, lng])
 
         // Stale check — a newer routePath was set while we were fetching
         if (token !== fetchTokenRef.current) return
 
-        // Stitch segments: drop the first point of each subsequent segment
-        // to avoid duplicate waypoints at junctions
-        const stitched = segments.reduce((acc, seg, i) => {
-          return acc.concat(i === 0 ? seg : seg.slice(1))
-        }, [])
+        // ── Flood intersection check against real GeoJSON geometry ────────
+        if (floodJsonRef.current && onFloodRisk) {
+          const detectedRisk = checkRouteFloodRisk(stitched, floodJsonRef.current)
+          onFloodRisk(detectedRisk)
+        }
 
         // Remove placeholder
         if (routeLayerRef.current) map.removeLayer(routeLayerRef.current)
@@ -233,7 +283,7 @@ export default function MapView({ routePath }) {
 
       } catch (err) {
         console.warn('OSRM fetch failed, keeping straight-line fallback:', err)
-        // Fallback: just upgrade the placeholder to a solid line
+        // Fallback: upgrade the placeholder to a solid line
         if (token !== fetchTokenRef.current) return
         if (routeLayerRef.current) map.removeLayer(routeLayerRef.current)
         const fallback = L.polyline(placeholderCoords, {
