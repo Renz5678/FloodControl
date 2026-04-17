@@ -4,21 +4,20 @@ import RoutePanel from './components/RoutePanel'
 
 export default function App() {
   const [routePath, setRoutePath] = useState([])
-  const [geoFloodRisk, setGeoFloodRisk] = useState(null)
+  const [routeRisk, setRouteRisk] = useState(0)
 
-  function handleRoute(path) {
+  function handleRoute(path, totalRisk = 0) {
     setRoutePath(path)
-    // Reset geo-detected flood risk until MapView re-checks the new path
-    setGeoFloodRisk(null)
+    setRouteRisk(totalRisk)
   }
 
   return (
     <div style={{ position: 'relative', width: '100vw', height: '100vh', overflow: 'hidden' }}>
       {/* Full-screen map */}
-      <MapView routePath={routePath} onFloodRisk={setGeoFloodRisk} />
+      <MapView routePath={routePath} routeRisk={routeRisk} />
 
       {/* Overlay panel */}
-      <RoutePanel onRoute={handleRoute} geoFloodRisk={geoFloodRisk} />
+      <RoutePanel onRoute={handleRoute} />
 
       {/* Attribution bar */}
       <div style={{
@@ -27,7 +26,7 @@ export default function App() {
         zIndex: 1000, pointerEvents: 'none',
         fontFamily: 'Inter, sans-serif',
       }}>
-        DesAlgo Demo · Dijkstra’s Algorithm · Metro Manila
+        DesAlgo Demo · Dijkstra's Algorithm · W = α·time + β·risk
       </div>
     </div>
   )

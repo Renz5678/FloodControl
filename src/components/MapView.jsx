@@ -1,11 +1,9 @@
-import { useState, useEffect, useRef } from 'react'
+import { useEffect, useRef } from 'react'
 import { nodes } from '../data/graph'
 
-// Import Leaflet CSS (must be before MapContainer)
 import 'leaflet/dist/leaflet.css'
 import L from 'leaflet'
 
-// Fix for default marker icons in Vite/webpack
 delete L.Icon.Default.prototype._getIconUrl
 L.Icon.Default.mergeOptions({
   iconRetinaUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
@@ -16,7 +14,6 @@ L.Icon.Default.mergeOptions({
 const MANILA_CENTER = [14.6180, 121.0025]
 const OSRM_BASE = 'https://router.project-osrm.org/route/v1/driving'
 
-// Custom divIcon for nodes
 function createNodeIcon(color = '#3b82f6', pulse = false) {
   const size = pulse ? 20 : 14
   const html = pulse
@@ -35,67 +32,21 @@ function createNodeIcon(color = '#3b82f6', pulse = false) {
   return L.divIcon({ html, className: '', iconAnchor: [size / 2, size / 2] })
 }
 
-
-// ── Geometry helpers ─────────────────────────────────────────────────────
-
-/**
- * Ray-casting point-in-polygon.
- * point = [lat, lng] (Leaflet order)
- * ring  = array of GeoJSON [lng, lat] pairs
- */
-function pointInPolygon([lat, lng], ring) {
-  let inside = false
-  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
-    const [rLng_i, rLat_i] = ring[i]
-    const [rLng_j, rLat_j] = ring[j]
-    const intersect =
-      rLat_i > lat !== rLat_j > lat &&
-      lng < ((rLng_j - rLng_i) * (lat - rLat_i)) / (rLat_j - rLat_i) + rLng_i
-    if (intersect) inside = !inside
-  }
-  return inside
+// ── Risk → color mapping ──────────────────────────────────────────────────────
+function riskToColor(risk) {
+  if (risk >= 0.80) return '#ef4444'
+  if (risk >= 0.30) return '#f97316'
+  return '#22c55e'
 }
 
-/**
- * Check whether any sampled route point lies inside a flood zone polygon.
- * Returns the detected max risk (0 = safe, 1 = moderate).
- * All flood features in this dataset are treated as moderate risk (1).
- */
-function checkRouteFloodRisk(routePoints, geojson) {
-  const features = geojson?.features ?? []
-  // Sample every 4th point for performance
-  const sampled = routePoints.filter((_, i) => i % 4 === 0)
-
-  for (const point of sampled) {
-    for (const feature of features) {
-      const geom = feature.geometry
-      if (!geom) continue
-
-      // Normalise to [[ring,...], ...] regardless of Polygon vs MultiPolygon
-      const ringsets =
-        geom.type === 'Polygon'
-          ? [geom.coordinates]
-          : geom.type === 'MultiPolygon'
-          ? geom.coordinates
-          : []
-
-      for (const rings of ringsets) {
-        const outer = rings[0] // first ring = outer boundary
-        if (pointInPolygon(point, outer)) return 1
-      }
-    }
-  }
-  return 0
-}
-
-export default function MapView({ routePath, onFloodRisk }) {
-  const mapRef = useRef(null)
-  const mapInstanceRef = useRef(null)
-  const routeLayerRef = useRef(null)
-  const nodeMarkersRef = useRef([])
-  const floodLayerRef = useRef(null)
-  const floodJsonRef = useRef(null)   // raw GeoJSON kept for intersection tests
-  const fetchTokenRef = useRef(0)     // cancellation token
+export default function MapView({ routePath, routeRisk = 0 }) {
+  const mapRef            = useRef(null)
+  const mapInstanceRef    = useRef(null)
+  const routeLayerRef     = useRef(null)   // OSRM road-following line
+  const dijkstraLayerRef  = useRef(null)   // Dijkstra path overlay (node dots + connecting lines)
+  const nodeMarkersRef    = useRef([])
+  const floodLayerRef     = useRef(null)
+  const fetchTokenRef     = useRef(0)
 
   // Init map once
   useEffect(() => {
@@ -107,34 +58,22 @@ export default function MapView({ routePath, onFloodRisk }) {
       zoomControl: false,
     })
 
-    // Dark basemap tile layer (CartoDB dark matter)
     L.tileLayer(
       'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
-      {
-        attribution: '&copy; <a href="https://carto.com/">CartoDB</a>',
-        subdomains: 'abcd',
-        maxZoom: 19,
-      }
+      { attribution: '&copy; <a href="https://carto.com/">CartoDB</a>', subdomains: 'abcd', maxZoom: 19 }
     ).addTo(map)
 
-    // Custom zoom control bottom-right
     L.control.zoom({ position: 'bottomright' }).addTo(map)
-
     mapInstanceRef.current = map
 
-    // Load flood overlay — also store raw GeoJSON for intersection tests
+    // Load flood overlay
     fetch('/flood_data.json')
       .then(r => r.json())
       .then(geojson => {
-        floodJsonRef.current = geojson          // ← keep for route checks
         floodLayerRef.current = L.geoJSON(geojson, {
           style: () => ({
-            color: '#f97316',
-            fillColor: '#f97316',
-            fillOpacity: 0.28,
-            weight: 1,
-            dashArray: '4 3',
-            opacity: 0.6,
+            color: '#f97316', fillColor: '#f97316',
+            fillOpacity: 0.28, weight: 1, dashArray: '4 3', opacity: 0.6,
           }),
           onEachFeature: (feature, layer) => {
             layer.bindTooltip(
@@ -151,155 +90,159 @@ export default function MapView({ routePath, onFloodRisk }) {
       })
       .catch(console.error)
 
-    // Draw all nodes as small dots
+    // Draw all graph nodes as small grey dots
     Object.values(nodes).forEach(node => {
-      const isPup = node.id === 'pup'
       const marker = L.marker(node.coords, {
-        icon: createNodeIcon(isPup ? '#22c55e' : '#64748b', isPup),
+        icon: createNodeIcon('#64748b', false),
         title: node.label,
       })
-
       marker.bindTooltip(
         `<div style="background:#1a1d27;color:#e2e8f0;border:1px solid rgba(255,255,255,0.1);
                     border-radius:6px;padding:5px 10px;font-family:Inter,sans-serif;font-size:0.8rem;">
-          ${isPup ? '🏁 ' : ''}${node.label}
+          ${node.label}
         </div>`,
         { opacity: 1, className: 'leaflet-tooltip-custom' }
       )
-
       marker.addTo(map)
       nodeMarkersRef.current.push({ id: node.id, marker })
     })
 
   }, [])
 
-  // Update route line when routePath changes — fetch real road geometry from OSRM
+  // Update route when routePath changes
   useEffect(() => {
     const map = mapInstanceRef.current
     if (!map) return
 
-    // Remove old route layer
+    // Remove old OSRM route layer
     if (routeLayerRef.current) {
       map.removeLayer(routeLayerRef.current)
       routeLayerRef.current = null
     }
 
-    // Reset all node markers to default
-    nodeMarkersRef.current.forEach(({ id, marker }) => {
-      const isPup = id === 'pup'
-      marker.setIcon(createNodeIcon(isPup ? '#22c55e' : '#64748b', isPup))
+    // Remove old Dijkstra overlay
+    if (dijkstraLayerRef.current) {
+      map.removeLayer(dijkstraLayerRef.current)
+      dijkstraLayerRef.current = null
+    }
+
+    // Reset all node markers to default grey
+    nodeMarkersRef.current.forEach(({ marker }) => {
+      marker.setIcon(createNodeIcon('#64748b', false))
     })
 
     if (!routePath || routePath.length < 2) return
 
-    // Issue a new fetch token; stale fetches will be ignored
     const token = ++fetchTokenRef.current
+    const lineColor = riskToColor(routeRisk)
 
-    // Draw a temporary dashed straight-line placeholder while OSRM loads
-    const placeholderCoords = routePath.map(id => nodes[id].coords)
-    const placeholder = L.polyline(placeholderCoords, {
-      color: '#22c55e',
+    // ── Dijkstra path overlay ─────────────────────────────────────────────
+    // Draw IMMEDIATELY (before OSRM loads) so the user can see which
+    // corridor the algorithm chose. This is what makes presets look different.
+    // ─────────────────────────────────────────────────────────────────────────
+    const nodeCoords = routePath.map(id => nodes[id].coords)
+
+    // Thin dashed white line connecting Dijkstra nodes
+    const dijkstraLine = L.polyline(nodeCoords, {
+      color: 'rgba(255,255,255,0.55)',
       weight: 2,
-      opacity: 0.4,
-      dashArray: '6 8',
-    }).addTo(map)
-    routeLayerRef.current = placeholder
-    map.fitBounds(L.latLngBounds(placeholderCoords), { padding: [60, 60] })
+      dashArray: '6 9',
+      lineCap: 'round',
+    })
 
-    /**
-     * Single OSRM request with ALL waypoints in one shot.
-     * This prevents the per-segment snapping that caused unnecessary left/right jogs.
-     */
+    // Small circles at every intermediate node (not origin/dest)
+    const intermediateDots = routePath.slice(1, -1).map(id =>
+      L.circleMarker(nodes[id].coords, {
+        radius: 5,
+        color: '#fff',
+        fillColor: lineColor,
+        fillOpacity: 0.85,
+        weight: 2,
+      })
+    )
+
+    dijkstraLayerRef.current = L.layerGroup([dijkstraLine, ...intermediateDots]).addTo(map)
+
+    // Highlight origin + destination nodes
+    routePath.forEach((id, i) => {
+      const entry = nodeMarkersRef.current.find(m => m.id === id)
+      if (!entry) return
+      const isOrigin = i === 0
+      const isDest   = i === routePath.length - 1
+      if (isOrigin || isDest) {
+        const color = isOrigin ? '#3b82f6' : '#22c55e'
+        entry.marker.setIcon(createNodeIcon(color, true))
+      }
+    })
+
+    // Fit map to the Dijkstra path bounds immediately
+    map.fitBounds(L.latLngBounds(nodeCoords), { padding: [80, 80] })
+
+    // ── OSRM road-following geometry ──────────────────────────────────────
+    // Send the FULL Dijkstra waypoint list so the road line follows the
+    // chosen corridor (e.g. Avenida bypass vs España). A proximity filter
+    // drops nodes closer than MIN_DIST_DEG to the previous waypoint so OSRM
+    // doesn't make tiny detours to nearly-coincident graph nodes (the former
+    // cause of zigzags). Origin and destination are always kept.
+    // ─────────────────────────────────────────────────────────────────────────
     async function fetchAndDraw() {
       try {
-        // Build waypoint string: OSRM expects lng,lat order
-        const waypointsStr = routePath
-          .map(id => {
-            const [lat, lng] = nodes[id].coords
-            return `${lng},${lat}`
-          })
+        const MIN_DIST_DEG = 0.004 // ≈ 400 m — minimum spacing between OSRM waypoints
+
+        const filtered = routePath.filter((id, i) => {
+          if (i === 0 || i === routePath.length - 1) return true   // always keep endpoints
+          const [pLat, pLng] = nodes[routePath[i - 1]].coords
+          const [cLat, cLng] = nodes[id].coords
+          const d = Math.sqrt((cLat - pLat) ** 2 + (cLng - pLng) ** 2)
+          return d >= MIN_DIST_DEG
+        })
+
+        const waypointsStr = filtered
+          .map(id => { const [lat, lng] = nodes[id].coords; return `${lng},${lat}` })
           .join(';')
 
         const url = `${OSRM_BASE}/${waypointsStr}?overview=full&geometries=geojson`
-        const res = await fetch(url)
-        if (!res.ok) throw new Error(`OSRM error: ${res.status}`)
+
+        const res  = await fetch(url)
+        if (!res.ok) throw new Error(`OSRM ${res.status}`)
         const data = await res.json()
         if (data.code !== 'Ok' || !data.routes?.[0]) throw new Error('No OSRM route')
 
-        // OSRM returns [lng, lat] — convert to Leaflet [lat, lng]
         const stitched = data.routes[0].geometry.coordinates.map(([lng, lat]) => [lat, lng])
 
-        // Stale check — a newer routePath was set while we were fetching
         if (token !== fetchTokenRef.current) return
 
-        // ── Flood intersection check against real GeoJSON geometry ────────
-        if (floodJsonRef.current && onFloodRisk) {
-          const detectedRisk = checkRouteFloodRisk(stitched, floodJsonRef.current)
-          onFloodRisk(detectedRisk)
-        }
-
-        // Remove placeholder
+        // Replace any old OSRM layer
         if (routeLayerRef.current) map.removeLayer(routeLayerRef.current)
 
-        // Draw road-following polyline with glow effect
+        // Glow + main + dash lines, all in the risk-driven color
         const glowLine = L.polyline(stitched, {
-          color: '#22c55e',
-          weight: 12,
-          opacity: 0.12,
-          lineCap: 'round',
-          lineJoin: 'round',
+          color: lineColor, weight: 14, opacity: 0.10,
+          lineCap: 'round', lineJoin: 'round',
         }).addTo(map)
 
         const mainLine = L.polyline(stitched, {
-          color: '#22c55e',
-          weight: 4,
-          opacity: 0.95,
-          lineCap: 'round',
-          lineJoin: 'round',
+          color: lineColor, weight: 4, opacity: 0.95,
+          lineCap: 'round', lineJoin: 'round',
         }).addTo(map)
 
         const dashLine = L.polyline(stitched, {
-          color: '#86efac',
-          weight: 2,
-          opacity: 0.55,
-          dashArray: '10 14',
-          lineCap: 'round',
+          color: lineColor, weight: 2, opacity: 0.50,
+          dashArray: '10 14', lineCap: 'round',
         }).addTo(map)
 
         routeLayerRef.current = L.layerGroup([glowLine, mainLine, dashLine]).addTo(map)
 
-        // Highlight nodes on route
-        routePath.forEach((id, i) => {
-          const entry = nodeMarkersRef.current.find(m => m.id === id)
-          if (!entry) return
-          const isOrigin = i === 0
-          const isDest = i === routePath.length - 1
-          const color = isOrigin ? '#3b82f6' : isDest ? '#22c55e' : '#86efac'
-          entry.marker.setIcon(createNodeIcon(color, isOrigin || isDest))
-        })
-
-        // Fit map to real road bounds
+        // Re-fit to real road bounds
         map.fitBounds(L.latLngBounds(stitched), { padding: [60, 60] })
 
       } catch (err) {
-        console.warn('OSRM fetch failed, keeping straight-line fallback:', err)
-        // Fallback: upgrade the placeholder to a solid line
-        if (token !== fetchTokenRef.current) return
-        if (routeLayerRef.current) map.removeLayer(routeLayerRef.current)
-        const fallback = L.polyline(placeholderCoords, {
-          color: '#22c55e', weight: 4, opacity: 0.9, lineCap: 'round',
-        }).addTo(map)
-        routeLayerRef.current = fallback
+        console.warn('OSRM fetch failed, keeping Dijkstra overlay as fallback:', err)
       }
     }
 
     fetchAndDraw()
   }, [routePath])
 
-  return (
-    <div
-      ref={mapRef}
-      style={{ position: 'absolute', inset: 0 }}
-    />
-  )
+  return <div ref={mapRef} style={{ position: 'absolute', inset: 0 }} />
 }
